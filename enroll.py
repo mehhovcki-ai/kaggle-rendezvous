@@ -1,38 +1,28 @@
 #!/usr/bin/env python3
 """Enroll a Kaggle account as a paws model-proxy notebook.
 
-Generates a single-cell notebook with the rendezvous URL and key baked in,
-pushes it with the `kaggle` CLI and starts it. Re-running is safe: the kernel
-id comes from the account name, so a second run updates and restarts the same
-notebook instead of creating another one.
+Two steps, on purpose:
+
+  1. push a benchmark task (creation only, nothing runs). That is what makes
+     Kaggle build a backing notebook with the benchmarks environment.
+  2. run that backing notebook as a notebook, not as a task. The notebook
+     starts the proxy, dials the rendezvous and blocks, so it keeps serving
+     instead of being a one-shot evaluation.
 
 Usage (from a checkout of kaggle-rendezvous):
 
     python enroll.py --key beta --username kirill
 
-Kaggle authentication is whatever the `kaggle` CLI already uses, which is why
-this shell outs to it instead of importing the package: `uv run` gives the
-script an isolated environment where `import kaggle` fails even though the
-CLI is on PATH. If the CLI has no credentials you get:
+    --no-run      only push the task, do not start the notebook
+    --dry-run     write the task file locally, do not push anything
 
-    Kaggle is not authenticated. Run `kaggle auth login` first.
-
-Options:
-    --key           rendezvous key the notebook presents on /connect
-    --username      pawsapi username; used for the kernel slug
-    --kaggle-user   Kaggle account name (default: from `kaggle config view`)
-    --kaggle-key    legacy API key (sets KAGGLE_USERNAME/KAGGLE_KEY for the CLI)
-    --slug          kernel slug (default: paws-bridge-<username>)
-    --url           rendezvous websocket URL
-    --public        make the notebook public (default: private)
-    --dry-run       write the notebook locally, do not push
-    --out           output directory (default: /tmp/<slug>)
+Kaggle auth is whatever the `kaggle` CLI already uses; this shells out to it
+instead of importing the package.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import shutil
@@ -44,36 +34,56 @@ from pathlib import Path
 DEFAULT_URL = "wss://rendezvous.paws.best/connect"
 HERE = Path(__file__).resolve().parent
 
-# The notebook is one cell. Order matters: install, config, proxy, bridge,
-# then the runner. Everything below is concatenated into that cell.
-INSTALL = '%pip install -q "fastapi==0.135.1" "uvicorn==0.42.0" "websockets==15.0.1"\n'
+HEADER = """# %% [markdown]
+# paws bridge for {username}
+#
+# Pushed as a benchmark task so the environment carries kaggle_benchmarks,
+# then the backing notebook is run directly. The key and URL are generated
+# per account.
 
-CONFIG = '''import os
+# %%
+%pip install -q "fastapi==0.135.1" "uvicorn==0.42.0" "websockets==15.0.1"
 
-# Injected by enroll.py for this account. Not Kaggle secrets: the notebook is
-# private and this only says which proxy it is.
+# %%
+import os
+
 os.environ["RENDEZVOUS_URL"] = {url!r}
 os.environ["RENDEZVOUS_KEY"] = {key!r}
 os.environ.setdefault("PROXY_API_KEY", "local-only")
 print("rendezvous:", os.environ["RENDEZVOUS_URL"])
 
+# %%
+# --- proxy ---------------------------------------------------------------
+{proxy}
 
-'''
+# %%
+# --- bridge --------------------------------------------------------------
+{bridge}
 
-RUNNER = '''
+# %%
+import time
 
-# --- runner ---------------------------------------------------------------
-server = serve(port=8000)
-bridge = connect(port=8000).ready(timeout=90)
-print("connected as", bridge.notebook_id, "->", bridge.public_base_url)
+import kaggle_benchmarks as kbench
 
-# No shutdown logic: the rendezvous stops routing new requests ten minutes
-# before the session cap, so this cell just holds the session open.
-import time as _time
 
-while True:
-    _time.sleep(60)
-'''
+@kbench.task(
+    name={task_name!r},
+    description="Runs the paws rendezvous proxy for this account.",
+)
+def {func_name}(llm=None) -> None:
+    server = serve(port=8000)
+    bridge = connect(port=8000).ready(timeout=90)
+    print("connected as", bridge.notebook_id, "->", bridge.public_base_url)
+
+    # No shutdown logic: the rendezvous stops routing new requests ten
+    # minutes before the session cap. This just holds the session open.
+    while True:
+        time.sleep(60)
+
+
+# Run on import, whether this executes as a task or as the backing notebook.
+{func_name}()
+"""
 
 
 def read_source(name: str) -> str:
@@ -83,65 +93,21 @@ def read_source(name: str) -> str:
     return path.read_text()
 
 
-def build_cell(url: str, key: str) -> str:
-    proxy = read_source("proxy_cell.py")
-    bridge = read_source("bridge_cell.py")
-    return "".join([
-        INSTALL,
-        CONFIG.format(url=url, key=key),
-        "# --- proxy ---------------------------------------------------------------\n",
-        proxy,
-        "\n\n# --- bridge --------------------------------------------------------------\n",
-        bridge,
-        RUNNER,
-    ])
-
-
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9-]+", "-", value.lower()).strip("-")
     return re.sub(r"-{2,}", "-", slug)
 
 
-def notebook(cell: str) -> dict:
-    return {
-        "cells": [
-            {
-                "cell_type": "code",
-                "execution_count": None,
-                "metadata": {},
-                "outputs": [],
-                "source": cell.splitlines(keepends=True),
-            }
-        ],
-        "metadata": {
-            "kernelspec": {
-                "display_name": "Python 3",
-                "language": "python",
-                "name": "python3",
-            },
-            "language_info": {"name": "python", "version": "3.12.10"},
-        },
-        "nbformat": 4,
-        "nbformat_minor": 4,
-    }
-
-
-def kernel_metadata(owner: str, slug: str, private: bool) -> dict:
-    return {
-        "id": f"{owner}/{slug}",
-        "title": slug,
-        "code_file": "notebook.ipynb",
-        "language": "python",
-        "kernel_type": "notebook",
-        "is_private": private,
-        "enable_gpu": False,
-        "enable_internet": True,
-        "machine_shape": "None",
-        "dataset_sources": [],
-        "competition_sources": [],
-        "kernel_sources": [],
-        "model_sources": [],
-    }
+def build_task(url: str, key: str, username: str, slug: str) -> str:
+    return HEADER.format(
+        username=username,
+        url=url,
+        key=key,
+        proxy=read_source("proxy_cell.py").rstrip(),
+        bridge=read_source("bridge_cell.py").rstrip(),
+        task_name=slug.replace("-", " "),
+        func_name=slug.replace("-", "_"),
+    )
 
 
 def kaggle_exe() -> str:
@@ -151,45 +117,22 @@ def kaggle_exe() -> str:
     return exe
 
 
-def kaggle_env(args: argparse.Namespace) -> dict:
-    env = os.environ.copy()
-    if args.kaggle_key:
-        if not args.kaggle_user:
-            sys.exit("--kaggle-key needs --kaggle-user as well")
-        env["KAGGLE_USERNAME"] = args.kaggle_user
-        env["KAGGLE_KEY"] = args.kaggle_key
-    return env
-
-
 def kaggle(*argv: str, env: dict, check: bool = True) -> subprocess.CompletedProcess:
-    proc = subprocess.run(
-        [kaggle_exe(), *argv], capture_output=True, text=True, env=env
-    )
+    proc = subprocess.run([kaggle_exe(), *argv], capture_output=True, text=True, env=env)
     if check and proc.returncode != 0:
-        output = (proc.stdout + proc.stderr).strip()
-        lowered = output.lower()
-        if "authenticate" in lowered or "credentials" in lowered or "login" in lowered:
-            sys.exit("Kaggle is not authenticated. Run `kaggle auth login` first.")
-        sys.exit(f"kaggle {argv[0]} {argv[1] if len(argv) > 1 else ''} failed:\n{output}")
+        print((proc.stdout or "") + (proc.stderr or ""), file=sys.stderr)
+        sys.exit(f"kaggle {' '.join(argv[:2])} failed")
     return proc
 
 
-def kaggle_owner(args: argparse.Namespace, env: dict) -> str:
-    if args.kaggle_user:
-        return args.kaggle_user
+def owner_of(env: dict) -> str:
     proc = kaggle("config", "view", env=env, check=False)
-    text = (proc.stdout or "") + (proc.stderr or "")
-    match = re.search(r"username[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_-]+)", text)
+    match = re.search(
+        r"username[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_-]+)",
+        (proc.stdout or "") + (proc.stderr or ""),
+    )
     if match:
         return match.group(1)
-    # the credentials file newer CLIs write
-    try:
-        data = json.loads((Path.home() / ".kaggle" / "credentials.json").read_text())
-        if data.get("username"):
-            return data["username"]
-    except Exception:
-        pass
-    # last resort: an authenticated API call that names our own kernels.
     listing = kaggle("kernels", "list", "-m", "--page-size", "1", env=env, check=False)
     for line in ((listing.stdout or "") + (listing.stderr or "")).splitlines():
         match = re.match(r"([A-Za-z0-9_-]+)/[A-Za-z0-9_-]+", line.strip())
@@ -198,63 +141,113 @@ def kaggle_owner(args: argparse.Namespace, env: dict) -> str:
     sys.exit("could not determine your Kaggle username; pass --kaggle-user")
 
 
+def wait_for_task(slug: str, env: dict, timeout: int = 180) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        proc = kaggle("benchmarks", "tasks", "status", slug, env=env, check=False)
+        text = (proc.stdout or "") + (proc.stderr or "")
+        if re.search(r"status:\s*(completed|complete)", text, re.I):
+            return True
+        if re.search(r"status:\s*(failed|error)", text, re.I):
+            print(text.strip()[-400:])
+            return False
+        time.sleep(8)
+    return False
+
+
+def find_backing_notebook(slug: str, owner: str, env: dict) -> str | None:
+    """Locate the notebook Kaggle created for the task.
+
+    The SDK exposes source_kernel_id (an int), but the CLI status does not
+    print it. The backing notebook shares the task slug, so an explicit pull
+    of <owner>/<slug> is the first guess, then a search.
+    """
+    candidate = f"{owner}/{slug}"
+    probe = kaggle("kernels", "pull", candidate, "-p", "/tmp/.kb-probe", "-m",
+                   env=env, check=False)
+    if probe.returncode == 0:
+        return candidate
+    listing = kaggle("kernels", "list", "-m", "-s", slug, "--page-size", "20",
+                     env=env, check=False)
+    for line in ((listing.stdout or "") + (listing.stderr or "")).splitlines():
+        match = re.search(r"\b([A-Za-z0-9_-]+/[A-Za-z0-9_-]*" + re.escape(slug) + r"[A-Za-z0-9_-]*)\b", line)
+        if match:
+            return match.group(1)
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--key", required=True, help="rendezvous key")
-    parser.add_argument("--username", required=True, help="pawsapi username")
+    parser.add_argument("--key", required=True)
+    parser.add_argument("--username", required=True)
     parser.add_argument("--kaggle-user", default=None)
     parser.add_argument("--kaggle-key", default=None)
     parser.add_argument("--slug", default=None)
     parser.add_argument("--url", default=DEFAULT_URL)
-    parser.add_argument("--public", dest="private", action="store_false", default=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-run", action="store_true", help="push the task only")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
     slug = args.slug or f"paws-bridge-{slugify(args.username)}"
-    cell = build_cell(args.url, args.key)
+    task = build_task(args.url, args.key, args.username, slug)
 
     out = Path(args.out or f"/tmp/{slug}")
     out.mkdir(parents=True, exist_ok=True)
-    (out / "notebook.ipynb").write_text(json.dumps(notebook(cell), indent=1))
-
-    env = kaggle_env(args)
-    owner = args.kaggle_user or args.username if args.dry_run else kaggle_owner(args, env)
-
-    (out / "kernel-metadata.json").write_text(
-        json.dumps(kernel_metadata(owner, slug, args.private), indent=2)
-    )
-    print(f"wrote {out}/notebook.ipynb ({len(cell.splitlines())} lines, 1 cell)")
-    print(f"kernel id: {owner}/{slug}  private={args.private}")
+    task_file = out / f"{slug}.py"
+    task_file.write_text(task)
+    print(f"wrote {task_file} ({len(task.splitlines())} lines)")
+    print(f"task: {slug}")
 
     if args.dry_run:
         print("dry run: not pushing")
         return
 
-    # The push itself is the only reliable auth test. `kaggle config view`
-    # exits non-zero on a machine that is perfectly well authenticated, so
-    # probing with it produced false negatives.
-    print("pushing kernel...")
-    push = kaggle("kernels", "push", "-p", str(out), env=env, check=False)
+    env = os.environ.copy()
+    if args.kaggle_key:
+        if not args.kaggle_user:
+            sys.exit("--kaggle-key needs --kaggle-user as well")
+        env["KAGGLE_USERNAME"] = args.kaggle_user
+        env["KAGGLE_KEY"] = args.kaggle_key
+    owner = args.kaggle_user or owner_of(env)
+
+    print("pushing benchmark task (creation only)...")
+    push = kaggle("benchmarks", "tasks", "push", slug, "-f", str(task_file),
+                  env=env, check=False)
     output = (push.stdout or "") + (push.stderr or "")
-    print(output.strip()[-800:] or "(no output)")
+    print(output.strip()[-1000:] or "(no output)")
     if push.returncode != 0:
         lowered = output.lower()
-        if any(word in lowered for word in ("authenticat", "credential", "login", "api token")):
+        if any(w in lowered for w in ("authenticat", "credential", "login", "api token")):
             sys.exit("Kaggle is not authenticated. Run `kaggle auth login` first.")
-        sys.exit("push failed; see the output above")
+        sys.exit("task push failed; see the output above")
 
-    kernel = f"{owner}/{slug}"
-    print(f"started: https://www.kaggle.com/code/{kernel}")
-    for _ in range(10):
-        status = kaggle("kernels", "status", kernel, env=env, check=False)
-        line = ((status.stdout or "") + (status.stderr or "")).strip().splitlines()
-        if line:
-            print("status:", line[-1][:160])
-        if "queued" not in " ".join(line).lower():
-            break
-        time.sleep(6)
-    print("done. the notebook keeps serving until the session cap.")
+    if args.no_run:
+        print("task created, not run. `kaggle b t run` when you want the task path.")
+        return
+
+    print("waiting for task creation...")
+    if not wait_for_task(slug, env):
+        print("task creation did not report complete in time; check `kaggle b t status`")
+        print("the backing notebook appears on the task page when creation finishes.")
+
+    print("locating the backing notebook...")
+    ref = find_backing_notebook(slug, owner, env)
+    if not ref:
+        sys.exit(
+            "could not find the backing notebook. open the task page and run it there, "
+            "or pass its ref explicitly later."
+        )
+    print(f"backing notebook: {ref}")
+
+    print("running the backing notebook...")
+    run = kaggle("kernels", "push", "-p", f"/tmp/.kb-probe", env=env, check=False)
+    print(((run.stdout or "") + (run.stderr or "")).strip()[-800:] or "(no output)")
+    if run.returncode != 0:
+        sys.exit("running the backing notebook failed; see the output above")
+
+    print(f"started: https://www.kaggle.com/code/{ref}")
+    print("the notebook keeps serving until the session cap.")
 
 
 if __name__ == "__main__":
