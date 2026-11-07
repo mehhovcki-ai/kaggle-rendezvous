@@ -125,20 +125,24 @@ def kaggle(*argv: str, env: dict, check: bool = True) -> subprocess.CompletedPro
     return proc
 
 
-def owner_of(env: dict) -> str:
-    proc = kaggle("config", "view", env=env, check=False)
-    match = re.search(
-        r"username[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_-]+)",
-        (proc.stdout or "") + (proc.stderr or ""),
-    )
-    if match:
-        return match.group(1)
-    listing = kaggle("kernels", "list", "-m", "--page-size", "1", env=env, check=False)
-    for line in ((listing.stdout or "") + (listing.stderr or "")).splitlines():
-        match = re.match(r"([A-Za-z0-9_-]+)/[A-Za-z0-9_-]+", line.strip())
-        if match:
-            return match.group(1)
-    sys.exit("could not determine your Kaggle username; pass --kaggle-user")
+def find_backing_notebook(slug: str, env: dict) -> str | None:
+    """Find the notebook Kaggle created for the task, without needing a username.
+
+    `kaggle config view` is a display format and its parsing broke on a real
+    machine, so discovery goes through the CSV listing instead: refs are
+    machine-readable and already carry owner/slug.
+    """
+    import csv
+    import io
+
+    listing = kaggle("kernels", "list", "-m", "--csv", "-s", slug,
+                     "--page-size", "20", env=env, check=False)
+    text = (listing.stdout or "") + (listing.stderr or "")
+    for row in csv.DictReader(io.StringIO(text)):
+        ref = (row.get("ref") or "").strip()
+        if ref and slug in ref:
+            return ref
+    return None
 
 
 def wait_for_task(slug: str, env: dict, timeout: int = 180) -> bool:
@@ -153,27 +157,6 @@ def wait_for_task(slug: str, env: dict, timeout: int = 180) -> bool:
             return False
         time.sleep(8)
     return False
-
-
-def find_backing_notebook(slug: str, owner: str, env: dict) -> str | None:
-    """Locate the notebook Kaggle created for the task.
-
-    The SDK exposes source_kernel_id (an int), but the CLI status does not
-    print it. The backing notebook shares the task slug, so an explicit pull
-    of <owner>/<slug> is the first guess, then a search.
-    """
-    candidate = f"{owner}/{slug}"
-    probe = kaggle("kernels", "pull", candidate, "-p", "/tmp/.kb-probe", "-m",
-                   env=env, check=False)
-    if probe.returncode == 0:
-        return candidate
-    listing = kaggle("kernels", "list", "-m", "-s", slug, "--page-size", "20",
-                     env=env, check=False)
-    for line in ((listing.stdout or "") + (listing.stderr or "")).splitlines():
-        match = re.search(r"\b([A-Za-z0-9_-]+/[A-Za-z0-9_-]*" + re.escape(slug) + r"[A-Za-z0-9_-]*)\b", line)
-        if match:
-            return match.group(1)
-    return None
 
 
 def main() -> None:
@@ -209,7 +192,6 @@ def main() -> None:
             sys.exit("--kaggle-key needs --kaggle-user as well")
         env["KAGGLE_USERNAME"] = args.kaggle_user
         env["KAGGLE_KEY"] = args.kaggle_key
-    owner = args.kaggle_user or owner_of(env)
 
     print("pushing benchmark task (creation only)...")
     push = kaggle("benchmarks", "tasks", "push", slug, "-f", str(task_file),
@@ -232,7 +214,7 @@ def main() -> None:
         print("the backing notebook appears on the task page when creation finishes.")
 
     print("locating the backing notebook...")
-    ref = find_backing_notebook(slug, owner, env)
+    ref = find_backing_notebook(slug, env)
     if not ref:
         sys.exit(
             "could not find the backing notebook. open the task page and run it there, "
