@@ -159,6 +159,13 @@ def wait_for_task(slug: str, env: dict, timeout: int = 180) -> bool:
     return False
 
 
+def task_ready(slug: str, env: dict) -> bool:
+    """True when the task already exists and finished creation."""
+    proc = kaggle("benchmarks", "tasks", "status", slug, env=env, check=False)
+    text = ((proc.stdout or "") + (proc.stderr or "")).lower()
+    return proc.returncode == 0 and "status:" in text and "completed" in text
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--key", required=True)
@@ -170,7 +177,9 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-run", action="store_true", help="push the task only")
     parser.add_argument("--recreate", action="store_true",
-                        help="build a fresh task version instead of reusing the notebook")
+                        help="build a fresh task version instead of reusing the task")
+    parser.add_argument("--model", default="google/gemini-3-flash-preview",
+                        help="model slug the benchmark run is scheduled against")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
@@ -195,15 +204,15 @@ def main() -> None:
         env["KAGGLE_USERNAME"] = args.kaggle_user
         env["KAGGLE_KEY"] = args.kaggle_key
 
-    existing = None if args.recreate else find_backing_notebook(slug, env)
-    if existing:
-        print(f"reusing existing notebook: {existing}")
-        ref = existing
-        if args.no_run:
-            print("not starting it (--no-run).")
-            return
+    if args.recreate:
+        exists = False
     else:
-        print("pushing benchmark task (creation only)...")
+        exists = task_ready(slug, env)
+        if exists:
+            print(f"reusing existing task: {slug}")
+
+    if not exists:
+        print("pushing benchmark task...")
         push = kaggle("benchmarks", "tasks", "push", slug, "-f", str(task_file),
                       env=env, check=False)
         output = (push.stdout or "") + (push.stderr or "")
@@ -215,38 +224,29 @@ def main() -> None:
             sys.exit("task push failed; see the output above")
 
         if args.no_run:
-            print("task created, not run. `kaggle b t run` when you want the task path.")
+            print("task created, not run. `kaggle b t run` when you want it.")
             return
 
         print("waiting for task creation...")
         if not wait_for_task(slug, env):
             print("task creation did not report complete in time; check `kaggle b t status`")
-            print("the backing notebook appears on the task page when creation finishes.")
 
-        print("locating the backing notebook...")
-        ref = find_backing_notebook(slug, env)
-        if not ref:
-            sys.exit(
-                "could not find the backing notebook. open the task page and run it there, "
-                "or pass its ref explicitly later."
-            )
+    if args.no_run:
+        print("task exists, not started (--no-run).")
+        return
 
-    print(f"backing notebook: {ref}")
-    print("pulling notebook files...")
-    shutil.rmtree("/tmp/.kb-probe", ignore_errors=True)
-    pull = kaggle("kernels", "pull", ref, "-p", "/tmp/.kb-probe", "-m",
-                  env=env, check=False)
-    if pull.returncode != 0:
-        sys.exit("could not pull the backing notebook")
-
-    print("running the backing notebook...")
-    run = kaggle("kernels", "push", "-p", f"/tmp/.kb-probe", env=env, check=False)
-    print(((run.stdout or "") + (run.stderr or "")).strip()[-800:] or "(no output)")
+    # The task run is what gets the benchmarks environment. Running the
+    # backing notebook directly does not, so this is the only path that works.
+    print("starting the task run...")
+    run = kaggle("benchmarks", "tasks", "run", slug, "-m", args.model,
+                 env=env, check=False)
+    run_out = (run.stdout or "") + (run.stderr or "")
+    print(run_out.strip()[-800:] or "(no output)")
     if run.returncode != 0:
-        sys.exit("running the backing notebook failed; see the output above")
+        sys.exit("task run failed; see the output above")
 
-    print(f"started: https://www.kaggle.com/code/{ref}")
-    print("the notebook keeps serving until the session cap.")
+    print(f"submitted: https://www.kaggle.com/benchmarks/tasks/{slug}")
+    print("the task keeps serving until the session cap.")
 
 
 if __name__ == "__main__":
