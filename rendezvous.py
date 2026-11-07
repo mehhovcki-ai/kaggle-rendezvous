@@ -91,6 +91,8 @@ import os
 import secrets
 import time
 import uuid
+
+import httpx
 from pathlib import Path
 from typing import Any
 
@@ -184,6 +186,43 @@ KEYS = KeyStore()
 KEYS.seed("rendezvous", "RENDEZVOUS_KEYS")
 KEYS.seed("client", "CLIENT_API_KEYS")
 KEYS.seed("admin", "ADMIN_API_KEYS")
+
+# --- pawsapi identity hook -------------------------------------------------
+# Local keys still work (env-seeded). A key that isn't local is checked
+# against pawsapi, so a notebook can present the user's own API key and the
+# connection is attributed to that account.
+PAWSAPI_VERIFY_URL = os.environ.get(
+    "PAWSAPI_INTERNAL_URL", "http://127.0.0.1:8765/v1/internal/kaggle/verify"
+)
+PAWSAPI_INTERNAL_TOKEN = os.environ.get("PAWSAPI_INTERNAL_TOKEN", "").strip()
+_REMOTE_CACHE: dict[str, tuple[float, dict]] = {}
+_REMOTE_TTL = 60.0
+
+
+async def verify_with_pawsapi(key: str) -> dict | None:
+    """Resolve a key to {user_id, username, key_id} via pawsapi."""
+    if not PAWSAPI_INTERNAL_TOKEN:
+        return None
+    now = time.time()
+    hit = _REMOTE_CACHE.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                PAWSAPI_VERIFY_URL,
+                json={"key": key},
+                headers={"X-Internal-Token": PAWSAPI_INTERNAL_TOKEN},
+            )
+    except Exception as exc:
+        log.warning("pawsapi verify unreachable: %r", exc)
+        return None
+    if resp.status_code != 200:
+        return None
+    data = resp.json()
+    _REMOTE_CACHE[key] = (now + _REMOTE_TTL, data)
+    return data
+
 
 
 # ---------------------------------------------------------------------------
@@ -541,18 +580,27 @@ _UI_PATH = Path(__file__).parent / "ui.html"
 async def notebook_connect(ws: WebSocket) -> None:
     auth = ws.headers.get("authorization", "")
     key = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-    if not key or not KEYS.valid("rendezvous", key):
+    if not key:
         await ws.close(code=4403, reason="invalid rendezvous key")
         return
+    identity = None
+    if not KEYS.valid("rendezvous", key):
+        identity = await verify_with_pawsapi(key)
+        if identity is None:
+            await ws.close(code=4403, reason="invalid rendezvous key")
+            return
     name = ws.headers.get("x-notebook-name", "notebook")
     await ws.accept()
     conn = NotebookConn(ws, name)
+    conn.user_id = (identity or {}).get("user_id")
+    conn.username = (identity or {}).get("username")
     POOL.add(conn)
     log.info("%s (%s) connected; %d notebook(s) online", conn.id, name, len(POOL.conns))
     await conn.send_json({
         "type": "welcome",
         "notebook_id": conn.id,
         "public_base_url": f"{PUBLIC_BASE_URL}/v1" if PUBLIC_BASE_URL else None,
+        "user": conn.username,
         "ts": time.time(),
     })
     try:
