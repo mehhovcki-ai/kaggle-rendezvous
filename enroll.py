@@ -169,6 +169,8 @@ def main() -> None:
     parser.add_argument("--url", default=DEFAULT_URL)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-run", action="store_true", help="push the task only")
+    parser.add_argument("--recreate", action="store_true",
+                        help="build a fresh task version instead of reusing the notebook")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
@@ -193,34 +195,49 @@ def main() -> None:
         env["KAGGLE_USERNAME"] = args.kaggle_user
         env["KAGGLE_KEY"] = args.kaggle_key
 
-    print("pushing benchmark task (creation only)...")
-    push = kaggle("benchmarks", "tasks", "push", slug, "-f", str(task_file),
-                  env=env, check=False)
-    output = (push.stdout or "") + (push.stderr or "")
-    print(output.strip()[-1000:] or "(no output)")
-    if push.returncode != 0:
-        lowered = output.lower()
-        if any(w in lowered for w in ("authenticat", "credential", "login", "api token")):
-            sys.exit("Kaggle is not authenticated. Run `kaggle auth login` first.")
-        sys.exit("task push failed; see the output above")
+    existing = None if args.recreate else find_backing_notebook(slug, env)
+    if existing:
+        print(f"reusing existing notebook: {existing}")
+        ref = existing
+        if args.no_run:
+            print("not starting it (--no-run).")
+            return
+    else:
+        print("pushing benchmark task (creation only)...")
+        push = kaggle("benchmarks", "tasks", "push", slug, "-f", str(task_file),
+                      env=env, check=False)
+        output = (push.stdout or "") + (push.stderr or "")
+        print(output.strip()[-1000:] or "(no output)")
+        if push.returncode != 0:
+            lowered = output.lower()
+            if any(w in lowered for w in ("authenticat", "credential", "login", "api token")):
+                sys.exit("Kaggle is not authenticated. Run `kaggle auth login` first.")
+            sys.exit("task push failed; see the output above")
 
-    if args.no_run:
-        print("task created, not run. `kaggle b t run` when you want the task path.")
-        return
+        if args.no_run:
+            print("task created, not run. `kaggle b t run` when you want the task path.")
+            return
 
-    print("waiting for task creation...")
-    if not wait_for_task(slug, env):
-        print("task creation did not report complete in time; check `kaggle b t status`")
-        print("the backing notebook appears on the task page when creation finishes.")
+        print("waiting for task creation...")
+        if not wait_for_task(slug, env):
+            print("task creation did not report complete in time; check `kaggle b t status`")
+            print("the backing notebook appears on the task page when creation finishes.")
 
-    print("locating the backing notebook...")
-    ref = find_backing_notebook(slug, env)
-    if not ref:
-        sys.exit(
-            "could not find the backing notebook. open the task page and run it there, "
-            "or pass its ref explicitly later."
-        )
+        print("locating the backing notebook...")
+        ref = find_backing_notebook(slug, env)
+        if not ref:
+            sys.exit(
+                "could not find the backing notebook. open the task page and run it there, "
+                "or pass its ref explicitly later."
+            )
+
     print(f"backing notebook: {ref}")
+    print("pulling notebook files...")
+    shutil.rmtree("/tmp/.kb-probe", ignore_errors=True)
+    pull = kaggle("kernels", "pull", ref, "-p", "/tmp/.kb-probe", "-m",
+                  env=env, check=False)
+    if pull.returncode != 0:
+        sys.exit("could not pull the backing notebook")
 
     print("running the backing notebook...")
     run = kaggle("kernels", "push", "-p", f"/tmp/.kb-probe", env=env, check=False)
