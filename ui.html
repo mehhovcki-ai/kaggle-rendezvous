@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>kaggle-rendezvous</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.4 ui-monospace, Menlo, Consolas, monospace; background:#111;
+         color:#ddd; max-width: 960px; margin: 24px auto; padding: 0 16px; }
+  h1 { font-size: 18px; } h2 { font-size: 15px; margin: 24px 0 8px; color:#8af; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+  th, td { border: 1px solid #333; padding: 4px 8px; text-align: left; }
+  th { background: #1a1a1a; color: #8af; font-weight: normal; }
+  input, select, button { font: inherit; background:#1c1c1c; color:#ddd;
+         border:1px solid #444; padding:4px 8px; border-radius:3px; }
+  button { cursor: pointer; } button:hover { background:#2a2a2a; }
+  button.danger { border-color:#a44; } button.danger:hover { background:#522; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+  .muted { color:#777; } .ok { color:#6d6; } .warn { color:#da6; } .err { color:#e66; }
+  .pill { padding:1px 6px; border:1px solid #555; border-radius:8px; font-size:12px; }
+  .pill.on { color:#6d6; border-color:#6d6; } .pill.off { color:#e66; border-color:#e66; }
+  #keybanner { background:#241; border:1px solid #4a4; padding:8px; margin:8px 0;
+               display:none; word-break:break-all; }
+  section { border-top:1px solid #333; padding-top:8px; }
+</style>
+</head>
+<body>
+<h1>kaggle-rendezvous <span class="muted" id="conn"></span></h1>
+
+<div class="row">
+  <input id="adminkey" type="password" placeholder="admin key" size="40">
+  <button onclick="saveKey()">save</button>
+  <button onclick="refresh()">refresh</button>
+  <span id="msg" class="muted"></span>
+</div>
+<div id="keybanner"></div>
+
+<section>
+<h2>Notebooks</h2>
+<table id="nbtable"><thead><tr>
+  <th>id</th><th>name</th><th>uptime</th><th>pending</th><th>relayed</th>
+  <th>draining</th><th>models</th><th></th>
+</tr></thead><tbody></tbody></table>
+<div id="nonb" class="muted">none connected</div>
+</section>
+
+<section>
+<h2>Model policy</h2>
+<div class="row">
+  <select id="polmode">
+    <option value="blacklist">blacklist</option>
+    <option value="whitelist">whitelist</option>
+  </select>
+  <input id="polmodels" placeholder="comma-separated models (optional replace)" size="46">
+  <button onclick="setPolicy()">apply</button>
+  <span class="muted" id="polcur"></span>
+</div>
+<table id="mtable"><thead><tr>
+  <th>model</th><th>upstream</th><th>notebooks</th><th>enabled</th><th></th>
+</tr></thead><tbody></tbody></table>
+</section>
+
+<section>
+<h2>Keys</h2>
+<div class="row">
+  <select id="keykind">
+    <option value="client">client</option>
+    <option value="rendezvous">rendezvous</option>
+    <option value="admin">admin</option>
+  </select>
+  <input id="keylabel" placeholder="label" size="20">
+  <button onclick="createKey()">create</button>
+  <span class="muted">full value shown once</span>
+</div>
+<table id="ktable"><thead><tr>
+  <th>kind</th><th>id</th><th>hint</th><th>label</th><th>created</th><th></th>
+</tr></thead><tbody></tbody></table>
+</section>
+
+<script>
+const S = sessionStorage;
+const $ = id => document.getElementById(id);
+$('adminkey').value = S.getItem('ak') || '';
+
+function key() { return $('adminkey').value.trim(); }
+function saveKey() { S.setItem('ak', key()); refresh(); }
+function say(t, cls) { const m=$('msg'); m.textContent=t; m.className=cls||'muted'; }
+
+async function api(path, opts={}) {
+  const r = await fetch(path, {headers: {
+    'Authorization': 'Bearer ' + key(),
+    ...(opts.body ? {'Content-Type': 'application/json'} : {}),
+  }, ...opts});
+  if (r.status === 401 || r.status === 403) {
+    say('admin key rejected', 'err'); throw new Error('auth');
+  }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { say((j.error && j.error.message) || r.statusText, 'err');
+               throw new Error(r.status); }
+  return j;
+}
+
+function fmtTs(ts) { return new Date(ts*1000).toLocaleString(); }
+function fmtUp(s) { return s > 3600 ? (s/3600).toFixed(1)+'h'
+                  : s > 60 ? (s/60).toFixed(0)+'m' : s.toFixed(0)+'s'; }
+function btn(label, fn, danger) {
+  const b = document.createElement('button');
+  b.textContent = label; b.onclick = fn;
+  if (danger) b.className = 'danger';
+  return b;
+}
+function td(v) { const e = document.createElement('td'); e.textContent = v; return e; }
+
+async function loadStatus() {
+  const j = await api('/admin/status');
+  $('conn').textContent = `— ${j.notebooks.length} notebook(s)`;
+  const tb = $('nbtable').tBodies[0]; tb.innerHTML = '';
+  $('nonb').style.display = j.notebooks.length ? 'none' : '';
+  for (const nb of j.notebooks) {
+    const tr = document.createElement('tr');
+    tr.append(td(nb.id), td(nb.name), td(fmtUp(nb.uptime_s)),
+              td(nb.pending_requests), td(nb.relayed_requests));
+    const d = td(''); d.innerHTML = nb.draining
+      ? '<span class="pill off">draining</span>'
+      : '<span class="pill on">live</span>';
+    tr.append(d, td((nb.models||[]).length || '—'));
+    const act = td('');
+    act.append(btn('drain', () => act('drain', nb.id)));
+    act.append(btn(' disconnect ', () => act('disconnect', nb.id), true));
+    tr.append(act);
+    tb.append(tr);
+  }
+  $('polcur').textContent =
+    `current: ${j.policy.mode} (${j.policy.models.length || '∅'})`;
+  $('polmode').value = j.policy.mode;
+}
+async function act(what, id) {
+  try { await api(`/admin/notebooks/${id}/${what}`, {method:'POST'}); }
+  catch(e) {} refresh();
+}
+
+async function loadModels() {
+  const j = await api('/admin/models');
+  const tb = $('mtable').tBodies[0]; tb.innerHTML = '';
+  for (const m of j.models) {
+    const tr = document.createElement('tr');
+    tr.append(td(m.id), td(m.upstream_model || '—'),
+              td((m.notebooks||[]).join(', ')));
+    const en = td(''); en.innerHTML = m.enabled
+      ? '<span class="pill on">enabled</span>'
+      : '<span class="pill off">disabled</span>';
+    tr.append(en);
+    const act = td('');
+    act.append(btn(m.enabled ? 'disable' : 'enable',
+      () => toggleModel(m.id, !m.enabled), m.enabled));
+    tr.append(act);
+    tb.append(tr);
+  }
+}
+async function toggleModel(id, en) {
+  try { await api(`/admin/models/${en?'enable':'disable'}`,
+    {method:'POST', body: JSON.stringify({model:id})}); }
+  catch(e) {} refresh();
+}
+async function setPolicy() {
+  const body = {mode: $('polmode').value};
+  const ms = $('polmodels').value.split(',').map(s=>s.trim()).filter(Boolean);
+  if (ms.length) body.models = ms;
+  try { await api('/admin/policy', {method:'POST', body: JSON.stringify(body)});
+        say('policy updated', 'ok'); }
+  catch(e) {} refresh();
+}
+
+async function loadKeys() {
+  const j = await api('/admin/keys');
+  const tb = $('ktable').tBodies[0]; tb.innerHTML = '';
+  for (const kind of Object.keys(j)) for (const k of j[kind]) {
+    const tr = document.createElement('tr');
+    tr.append(td(k.kind), td(k.id), td(k.hint), td(k.label || '—'),
+              td(fmtTs(k.created_at)));
+    const act = td('');
+    act.append(btn('revoke', () => revokeKey(k.id), true));
+    tr.append(act);
+    tb.append(tr);
+  }
+}
+async function createKey() {
+  try {
+    const j = await api('/admin/keys', {method:'POST', body: JSON.stringify({
+      kind: $('keykind').value, label: $('keylabel').value})});
+    const b = $('keybanner');
+    b.style.display = 'block';
+    b.innerHTML = `<b>${j.kind}</b> key (copy now, shown once):
+      <code>${j.value}</code>
+      <button onclick="navigator.clipboard.writeText('${j.value}')">copy</button>`;
+  } catch(e) {} refresh();
+}
+async function revokeKey(id) {
+  try { await api('/admin/keys/' + id, {method:'DELETE'}); }
+  catch(e) {} refresh();
+}
+
+async function refresh() {
+  try {
+    await Promise.all([loadStatus(), loadModels(), loadKeys()]);
+    say('updated ' + new Date().toLocaleTimeString(), 'ok');
+  } catch(e) { /* api() already reported */ }
+}
+refresh();
+setInterval(() => { if (key()) refresh().catch(()=>{}); }, 5000);
+</script>
+</body>
+</html>

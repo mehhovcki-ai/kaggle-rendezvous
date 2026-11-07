@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+.venv/
+env.sh
+bench-testing.txt
+bench-testing.orig.ipynb
