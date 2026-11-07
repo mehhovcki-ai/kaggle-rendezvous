@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 """Enroll a Kaggle account as a paws model-proxy notebook.
 
-Generates a single-cell notebook with the rendezvous URL and key baked into
-the cell, pushes it to Kaggle and starts it. Re-running is safe: the kernel
-id is derived from the username, so a second run updates and restarts the
-same notebook instead of creating another one.
+Generates a single-cell notebook with the rendezvous URL and key baked in,
+pushes it with the `kaggle` CLI and starts it. Re-running is safe: the kernel
+id comes from the account name, so a second run updates and restarts the same
+notebook instead of creating another one.
 
 Usage (from a checkout of kaggle-rendezvous):
 
     python enroll.py --key beta --username kirill
 
-Kaggle authentication: reads ~/.kaggle/kaggle.json. If that file is missing
-and no --kaggle-key was given, the script stops and tells you to authenticate
-first. You can also pass credentials explicitly:
+Kaggle authentication is whatever the `kaggle` CLI already uses, which is why
+this shell outs to it instead of importing the package: `uv run` gives the
+script an isolated environment where `import kaggle` fails even though the
+CLI is on PATH. If the CLI has no credentials you get:
 
-    python enroll.py --key beta --username kirill \
-        --kaggle-user kirill --kaggle-key <kaggle api key>
+    Kaggle is not authenticated. Run `kaggle auth login` first.
 
 Options:
     --key           rendezvous key the notebook presents on /connect
-    --username      pawsapi/kaggle username; used for the kernel id
-    --kaggle-user   Kaggle account name (defaults to KAGGLE_USERNAME)
-    --kaggle-key    Kaggle API key (defaults to ~/.kaggle/kaggle.json)
-    --slug          kernel slug (defaults to paws-bridge-<username>)
+    --username      pawsapi username; used for the kernel slug
+    --kaggle-user   Kaggle account name (default: from `kaggle config view`)
+    --kaggle-key    legacy API key (sets KAGGLE_USERNAME/KAGGLE_KEY for the CLI)
+    --slug          kernel slug (default: paws-bridge-<username>)
     --url           rendezvous websocket URL
-    --private       keep the notebook private (default: on)
+    --public        make the notebook public (default: private)
     --dry-run       write the notebook locally, do not push
+    --out           output directory (default: /tmp/<slug>)
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -74,7 +77,6 @@ while True:
 
 
 def read_source(name: str) -> str:
-    """Load a source file from the checkout, with a clear error if missing."""
     path = HERE / name
     if not path.is_file():
         sys.exit(f"missing {name} next to enroll.py (run from the repo checkout)")
@@ -82,10 +84,9 @@ def read_source(name: str) -> str:
 
 
 def build_cell(url: str, key: str) -> str:
-    """Assemble the single notebook cell: install, config, proxy, bridge, run."""
     proxy = read_source("proxy_cell.py")
     bridge = read_source("bridge_cell.py")
-    parts = [
+    return "".join([
         INSTALL,
         CONFIG.format(url=url, key=key),
         "# --- proxy ---------------------------------------------------------------\n",
@@ -93,8 +94,7 @@ def build_cell(url: str, key: str) -> str:
         "\n\n# --- bridge --------------------------------------------------------------\n",
         bridge,
         RUNNER,
-    ]
-    return "".join(parts)
+    ])
 
 
 def slugify(value: str) -> str:
@@ -103,7 +103,6 @@ def slugify(value: str) -> str:
 
 
 def notebook(cell: str) -> dict:
-    """A notebook with exactly one code cell."""
     return {
         "cells": [
             {
@@ -145,46 +144,52 @@ def kernel_metadata(owner: str, slug: str, private: bool) -> dict:
     }
 
 
-def kaggle_api(args: argparse.Namespace):
-    """Authenticate through the Kaggle client and return (api, username).
+def kaggle_exe() -> str:
+    exe = shutil.which("kaggle")
+    if not exe:
+        sys.exit("the kaggle CLI is not on PATH; install it or fix PATH")
+    return exe
 
-    Deliberately does not inspect credential files: kaggle 2.x reads
-    ~/.kaggle/access_token / credentials.json / KAGGLE_API_TOKEN and older
-    versions read kaggle.json. Letting the client decide keeps this working
-    across all of them.
-    """
+
+def kaggle_env(args: argparse.Namespace) -> dict:
+    env = os.environ.copy()
     if args.kaggle_key:
         if not args.kaggle_user:
             sys.exit("--kaggle-key needs --kaggle-user as well")
-        os.environ["KAGGLE_USERNAME"] = args.kaggle_user
-        os.environ["KAGGLE_KEY"] = args.kaggle_key
+        env["KAGGLE_USERNAME"] = args.kaggle_user
+        env["KAGGLE_KEY"] = args.kaggle_key
+    return env
 
+
+def kaggle(*argv: str, env: dict, check: bool = True) -> subprocess.CompletedProcess:
+    proc = subprocess.run(
+        [kaggle_exe(), *argv], capture_output=True, text=True, env=env
+    )
+    if check and proc.returncode != 0:
+        output = (proc.stdout + proc.stderr).strip()
+        lowered = output.lower()
+        if "authenticate" in lowered or "credentials" in lowered or "login" in lowered:
+            sys.exit("Kaggle is not authenticated. Run `kaggle auth login` first.")
+        sys.exit(f"kaggle {argv[0]} {argv[1] if len(argv) > 1 else ''} failed:\n{output}")
+    return proc
+
+
+def kaggle_owner(args: argparse.Namespace, env: dict) -> str:
+    if args.kaggle_user:
+        return args.kaggle_user
+    proc = kaggle("config", "view", env=env, check=False)
+    text = (proc.stdout or "") + (proc.stderr or "")
+    match = re.search(r"username[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_-]+)", text)
+    if match:
+        return match.group(1)
+    # last resort: the credentials file newer CLIs write
     try:
-        from kaggle.api.kaggle_api_extended import KaggleApi
-    except ImportError:
-        sys.exit("the kaggle package is not installed: pip install kaggle")
-
-    api = KaggleApi()
-    try:
-        api.authenticate()
-    except SystemExit:
-        # kaggle's authenticate() prints its own help and exits(1) when no
-        # credential source resolves; turn that into one clear line.
-        sys.exit(
-            "Kaggle is not authenticated.\n"
-            "Run `kaggle auth login` first, or pass --kaggle-user/--kaggle-key."
-        )
-    if not getattr(api, "_authenticated", False):
-        sys.exit(
-            "Kaggle is not authenticated.\n"
-            "Run `kaggle auth login` first, or pass --kaggle-user/--kaggle-key."
-        )
-
-    values = getattr(api, "config_values", {}) or {}
-    owner = args.kaggle_user or values.get("username") or os.environ.get("KAGGLE_USERNAME")
-    if not owner:
-        sys.exit("authenticated, but no Kaggle username found; pass --kaggle-user")
-    return api, owner
+        data = json.loads((Path.home() / ".kaggle" / "credentials.json").read_text())
+        if data.get("username"):
+            return data["username"]
+    except Exception:
+        pass
+    sys.exit("could not determine your Kaggle username; pass --kaggle-user")
 
 
 def main() -> None:
@@ -195,10 +200,9 @@ def main() -> None:
     parser.add_argument("--kaggle-key", default=None)
     parser.add_argument("--slug", default=None)
     parser.add_argument("--url", default=DEFAULT_URL)
-    parser.add_argument("--private", dest="private", action="store_true", default=True)
-    parser.add_argument("--public", dest="private", action="store_false")
+    parser.add_argument("--public", dest="private", action="store_false", default=True)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--out", default=None, help="output directory")
+    parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
     slug = args.slug or f"paws-bridge-{slugify(args.username)}"
@@ -208,11 +212,8 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     (out / "notebook.ipynb").write_text(json.dumps(notebook(cell), indent=1))
 
-    api = None
-    if args.dry_run:
-        owner = args.kaggle_user or os.environ.get("KAGGLE_USERNAME") or args.username
-    else:
-        api, owner = kaggle_api(args)
+    env = kaggle_env(args)
+    owner = args.kaggle_user or args.username if args.dry_run else kaggle_owner(args, env)
 
     (out / "kernel-metadata.json").write_text(
         json.dumps(kernel_metadata(owner, slug, args.private), indent=2)
@@ -224,26 +225,30 @@ def main() -> None:
         print("dry run: not pushing")
         return
 
+    if not args.kaggle_key:
+        # Fail with one clear line before writing anything to Kaggle.
+        probe = kaggle("config", "view", env=env, check=False)
+        text = ((probe.stdout or "") + (probe.stderr or "")).lower()
+        if probe.returncode != 0 or "not authenticated" in text or "no credentials" in text:
+            sys.exit("Kaggle is not authenticated. Run `kaggle auth login` first.")
+
     print("pushing kernel...")
-    api.kernels_push(str(out))
+    push = kaggle("kernels", "push", "-p", str(out), env=env, check=False)
+    output = (push.stdout or "") + (push.stderr or "")
+    print(output.strip()[-800:] or "(no output)")
+    if push.returncode != 0:
+        sys.exit("push failed; see the output above")
 
     kernel = f"{owner}/{slug}"
-    url = f"https://www.kaggle.com/code/{kernel}"
-    print(f"started: {url}")
-
-    # Report the first status that is not queued, so the shell exit means
-    # something. The run itself keeps going after this script ends.
+    print(f"started: https://www.kaggle.com/code/{kernel}")
     for _ in range(10):
-        try:
-            status = api.kernels_status(kernel)
-            state = getattr(status, "status", None) or str(status)
-            print(f"status: {state}")
-            if state and "queued" not in str(state).lower():
-                break
-        except Exception as exc:
-            print(f"status check failed: {exc}")
+        status = kaggle("kernels", "status", kernel, env=env, check=False)
+        line = ((status.stdout or "") + (status.stderr or "")).strip().splitlines()
+        if line:
+            print("status:", line[-1][:160])
+        if "queued" not in " ".join(line).lower():
+            break
         time.sleep(6)
-
     print("done. the notebook keeps serving until the session cap.")
 
 
