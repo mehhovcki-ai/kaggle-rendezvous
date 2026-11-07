@@ -65,13 +65,13 @@ def ensure_venv() -> None:
     if not venv_python().exists():
         print(f"creating venv at {VENV}")
         venv.EnvBuilder(with_pip=True).create(VENV)
-    print("installing kaggle + jupytext (first run takes a minute)")
+    print("installing kaggle + jupytext + six (first run takes a minute)")
     subprocess.run(
         [str(venv_python()), "-m", "pip", "install", "-q", "--upgrade", "pip"],
         check=False,
     )
     result = subprocess.run(
-        [str(venv_python()), "-m", "pip", "install", "-q", "kaggle", "jupytext"],
+        [str(venv_python()), "-m", "pip", "install", "-q", "kaggle", "jupytext", "six"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
