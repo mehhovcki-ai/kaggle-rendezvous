@@ -182,13 +182,19 @@ def kaggle_owner(args: argparse.Namespace, env: dict) -> str:
     match = re.search(r"username[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_-]+)", text)
     if match:
         return match.group(1)
-    # last resort: the credentials file newer CLIs write
+    # the credentials file newer CLIs write
     try:
         data = json.loads((Path.home() / ".kaggle" / "credentials.json").read_text())
         if data.get("username"):
             return data["username"]
     except Exception:
         pass
+    # last resort: an authenticated API call that names our own kernels.
+    listing = kaggle("kernels", "list", "-m", "--page-size", "1", env=env, check=False)
+    for line in ((listing.stdout or "") + (listing.stderr or "")).splitlines():
+        match = re.match(r"([A-Za-z0-9_-]+)/[A-Za-z0-9_-]+", line.strip())
+        if match:
+            return match.group(1)
     sys.exit("could not determine your Kaggle username; pass --kaggle-user")
 
 
@@ -225,18 +231,17 @@ def main() -> None:
         print("dry run: not pushing")
         return
 
-    if not args.kaggle_key:
-        # Fail with one clear line before writing anything to Kaggle.
-        probe = kaggle("config", "view", env=env, check=False)
-        text = ((probe.stdout or "") + (probe.stderr or "")).lower()
-        if probe.returncode != 0 or "not authenticated" in text or "no credentials" in text:
-            sys.exit("Kaggle is not authenticated. Run `kaggle auth login` first.")
-
+    # The push itself is the only reliable auth test. `kaggle config view`
+    # exits non-zero on a machine that is perfectly well authenticated, so
+    # probing with it produced false negatives.
     print("pushing kernel...")
     push = kaggle("kernels", "push", "-p", str(out), env=env, check=False)
     output = (push.stdout or "") + (push.stderr or "")
     print(output.strip()[-800:] or "(no output)")
     if push.returncode != 0:
+        lowered = output.lower()
+        if any(word in lowered for word in ("authenticat", "credential", "login", "api token")):
+            sys.exit("Kaggle is not authenticated. Run `kaggle auth login` first.")
         sys.exit("push failed; see the output above")
 
     kernel = f"{owner}/{slug}"
