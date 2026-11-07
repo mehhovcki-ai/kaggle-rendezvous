@@ -145,23 +145,46 @@ def kernel_metadata(owner: str, slug: str, private: bool) -> dict:
     }
 
 
-def ensure_kaggle_auth(args: argparse.Namespace) -> None:
-    """Fail early with a human message when Kaggle has no credentials."""
+def kaggle_api(args: argparse.Namespace):
+    """Authenticate through the Kaggle client and return (api, username).
+
+    Deliberately does not inspect credential files: kaggle 2.x reads
+    ~/.kaggle/access_token / credentials.json / KAGGLE_API_TOKEN and older
+    versions read kaggle.json. Letting the client decide keeps this working
+    across all of them.
+    """
     if args.kaggle_key:
         if not args.kaggle_user:
             sys.exit("--kaggle-key needs --kaggle-user as well")
         os.environ["KAGGLE_USERNAME"] = args.kaggle_user
         os.environ["KAGGLE_KEY"] = args.kaggle_key
-        return
-    config = Path.home() / ".kaggle" / "kaggle.json"
-    if not config.is_file() and not (
-        os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")
-    ):
+
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+    except ImportError:
+        sys.exit("the kaggle package is not installed: pip install kaggle")
+
+    api = KaggleApi()
+    try:
+        api.authenticate()
+    except SystemExit:
+        # kaggle's authenticate() prints its own help and exits(1) when no
+        # credential source resolves; turn that into one clear line.
         sys.exit(
             "Kaggle is not authenticated.\n"
-            "Run `kaggle auth login` first, or put your API token in "
-            "~/.kaggle/kaggle.json, or pass --kaggle-user/--kaggle-key."
+            "Run `kaggle auth login` first, or pass --kaggle-user/--kaggle-key."
         )
+    if not getattr(api, "_authenticated", False):
+        sys.exit(
+            "Kaggle is not authenticated.\n"
+            "Run `kaggle auth login` first, or pass --kaggle-user/--kaggle-key."
+        )
+
+    values = getattr(api, "config_values", {}) or {}
+    owner = args.kaggle_user or values.get("username") or os.environ.get("KAGGLE_USERNAME")
+    if not owner:
+        sys.exit("authenticated, but no Kaggle username found; pass --kaggle-user")
+    return api, owner
 
 
 def main() -> None:
@@ -185,15 +208,11 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     (out / "notebook.ipynb").write_text(json.dumps(notebook(cell), indent=1))
 
-    owner = args.kaggle_user or os.environ.get("KAGGLE_USERNAME")
-    if not owner and not args.dry_run:
-        ensure_kaggle_auth(args)
-        try:
-            with open(Path.home() / ".kaggle" / "kaggle.json") as fh:
-                owner = json.load(fh).get("username")
-        except Exception:
-            sys.exit("could not read the Kaggle username from ~/.kaggle/kaggle.json")
-    owner = owner or args.username
+    api = None
+    if args.dry_run:
+        owner = args.kaggle_user or os.environ.get("KAGGLE_USERNAME") or args.username
+    else:
+        api, owner = kaggle_api(args)
 
     (out / "kernel-metadata.json").write_text(
         json.dumps(kernel_metadata(owner, slug, args.private), indent=2)
@@ -205,12 +224,6 @@ def main() -> None:
         print("dry run: not pushing")
         return
 
-    ensure_kaggle_auth(args)
-
-    from kaggle.api.kaggle_api_extended import KaggleApi
-
-    api = KaggleApi()
-    api.authenticate()
     print("pushing kernel...")
     api.kernels_push(str(out))
 
