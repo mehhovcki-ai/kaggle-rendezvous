@@ -145,27 +145,6 @@ def find_backing_notebook(slug: str, env: dict) -> str | None:
     return None
 
 
-def wait_for_task(slug: str, env: dict, timeout: int = 180) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        proc = kaggle("benchmarks", "tasks", "status", slug, env=env, check=False)
-        text = (proc.stdout or "") + (proc.stderr or "")
-        if re.search(r"status:\s*(completed|complete)", text, re.I):
-            return True
-        if re.search(r"status:\s*(failed|error)", text, re.I):
-            print(text.strip()[-400:])
-            return False
-        time.sleep(8)
-    return False
-
-
-def task_ready(slug: str, env: dict) -> bool:
-    """True when the task already exists and finished creation."""
-    proc = kaggle("benchmarks", "tasks", "status", slug, env=env, check=False)
-    text = ((proc.stdout or "") + (proc.stderr or "")).lower()
-    return proc.returncode == 0 and "status:" in text and "completed" in text
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--key", required=True)
@@ -204,39 +183,30 @@ def main() -> None:
         env["KAGGLE_USERNAME"] = args.kaggle_user
         env["KAGGLE_KEY"] = args.kaggle_key
 
-    if args.recreate:
-        exists = False
-    else:
-        exists = task_ready(slug, env)
-        if exists:
-            print(f"reusing existing task: {slug}")
-
-    if not exists:
-        print("pushing benchmark task...")
+    print("pushing benchmark task...")
+    push = kaggle("benchmarks", "tasks", "push", slug, "-f", str(task_file),
+                  env=env, check=False)
+    output = (push.stdout or "") + (push.stderr or "")
+    print(output.strip()[-1000:] or "(no output)")
+    if push.returncode != 0 and "creation is still pending" in output.lower():
+        # Kaggle refuses a new push while the previous version is still being
+        # built. This is the one wait we cannot skip: the CLI requires --wait
+        # to proceed, otherwise every retry fails the same way.
+        print("previous creation pending, waiting for it...")
         push = kaggle("benchmarks", "tasks", "push", slug, "-f", str(task_file),
-                      env=env, check=False)
+                      "--wait", env=env, check=False)
         output = (push.stdout or "") + (push.stderr or "")
         print(output.strip()[-1000:] or "(no output)")
-        if push.returncode != 0:
-            lowered = output.lower()
-            if any(w in lowered for w in ("authenticat", "credential", "login", "api token")):
-                sys.exit("Kaggle is not authenticated. Run `kaggle auth login` first.")
-            sys.exit("task push failed; see the output above")
-
-        if args.no_run:
-            print("task created, not run. `kaggle b t run` when you want it.")
-            return
-
-        print("waiting for task creation...")
-        if not wait_for_task(slug, env):
-            print("task creation did not report complete in time; check `kaggle b t status`")
+    if push.returncode != 0:
+        lowered = output.lower()
+        if any(w in lowered for w in ("authenticat", "credential", "login", "api token")):
+            sys.exit("Kaggle is not authenticated. Run `kaggle auth login` first.")
+        sys.exit("task push failed; see the output above")
 
     if args.no_run:
-        print("task exists, not started (--no-run).")
+        print("task created, not run.")
         return
 
-    # The task run is what gets the benchmarks environment. Running the
-    # backing notebook directly does not, so this is the only path that works.
     print("starting the task run...")
     run = kaggle("benchmarks", "tasks", "run", slug, "-m", args.model,
                  env=env, check=False)

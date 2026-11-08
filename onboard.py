@@ -144,6 +144,8 @@ def main() -> None:
                         help="stop before login; just prepare the environment")
     parser.add_argument("--no-run", action="store_true",
                         help="create the task but do not start the notebook")
+    parser.add_argument("--no-login", action="store_true",
+                        help="never open a browser login; fail if the token is rejected")
     args = parser.parse_args()
 
     print(f"platform: {platform.system()} {platform.machine()}")
@@ -154,7 +156,11 @@ def main() -> None:
         print("\ndry run complete. rerun without --dry-run to log in and enroll.")
         return
 
-    login(env)
+    if args.no_login:
+        if not authenticated(env):
+            sys.exit("kaggle token rejected")
+    else:
+        login(env)
     username, key = collect(args)
     extra = ["--no-run"] if args.no_run else []
     code = run_enroll(username, key, env, extra)
