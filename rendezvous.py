@@ -505,6 +505,22 @@ async def fetch_models(conn: NotebookConn) -> dict[str, str | None]:
     return conn.models
 
 
+async def warm_models(conn: NotebookConn) -> None:
+    """Fill the model list right after connect, with a few retries.
+
+    The notebook may still be starting its proxy when the socket opens, so a
+    single attempt can come back empty. Three passes with backoff is enough.
+    """
+    for delay in (0, 5, 15):
+        if delay:
+            await asyncio.sleep(delay)
+        models = await fetch_models(conn)
+        if models:
+            log.info("%s: %d model(s) reported", conn.id, len(models))
+            return
+    log.info("%s: no models reported yet", conn.id)
+
+
 def _model_equivalents(model: str) -> set[str]:
     """All ids that could refer to `model`: itself, its upstream, its aliases."""
     ids = {model}
@@ -594,6 +610,9 @@ async def notebook_connect(ws: WebSocket) -> None:
     conn = NotebookConn(ws, name)
     conn.user_id = (identity or {}).get("user_id")
     conn.username = (identity or {}).get("username")
+    log.info("%s auth: key=%s… source=%s user=%s", conn.id, key[:5],
+             "pawsapi" if identity else "env", conn.username or "-")
+    asyncio.create_task(warm_models(conn))
     POOL.add(conn)
     log.info("%s (%s) connected; %d notebook(s) online", conn.id, name, len(POOL.conns))
     await conn.send_json({
@@ -700,6 +719,8 @@ async def admin_status():
                 "pending_requests": len(c.pending),
                 "relayed_requests": c.relayed,
                 "draining": c.draining,
+                "username": getattr(c, "username", None),
+                "user_id": getattr(c, "user_id", None),
                 "models": sorted(c.models),
             }
             for c in POOL.conns.values()
